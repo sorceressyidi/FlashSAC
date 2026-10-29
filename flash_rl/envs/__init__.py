@@ -144,6 +144,13 @@ def create_envs(
             use_push_randomization=False,
         )
 
+    elif env_type == "pxp":
+        from flash_rl.envs.pxp import make_pxp_envs
+
+        train_env, eval_env, record_env = make_pxp_envs(
+            seed=seed, num_train_envs=num_train_envs, num_eval_envs=num_eval_envs, **kwargs
+        )
+
     elif env_type == "genesis":
         from flash_rl.envs.genesis import make_genesis_env
 

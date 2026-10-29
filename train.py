@@ -93,7 +93,7 @@ def run(args: argparse.Namespace) -> None:
     # load model if given
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     save_path_resolved = cfg.save_path.replace("TIMESTAMP", datetime.now().strftime("%m%d-%H%M%S"))
-    save_path_base = script_dir + "/" + save_path_resolved
+    save_path_base = save_path_resolved if os.path.isabs(save_path_resolved) else script_dir + "/" + save_path_resolved
     if cfg.agent_load_path is not None:
         load_path = os.path.join(script_dir, cfg.agent_load_path)
         agent.load(load_path)

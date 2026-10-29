@@ -47,7 +47,7 @@ class TensorboardTrainerLogger:
         from torch.utils.tensorboard import SummaryWriter
 
         timestamp = datetime.now().strftime("%m%d_%H%M%S")
-        log_dir = f"runs/{cfg.group_name}/{cfg.exp_name}/{cfg.env.env_name}_seed{cfg.seed}_{timestamp}"
+        log_dir = cfg.log_dir if cfg.get("log_dir") else f"runs/{cfg.group_name}/{cfg.exp_name}/{cfg.env.env_name}_seed{cfg.seed}_{timestamp}"
         self.writer = SummaryWriter(log_dir=log_dir)  # type: ignore[no-untyped-call]
         self.writer.add_text("config", OmegaConf.to_yaml(cfg))  # type: ignore[no-untyped-call]
         self.media_dict: dict[str, Any] = {}
