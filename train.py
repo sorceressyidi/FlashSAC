@@ -26,6 +26,49 @@ from flash_rl.evaluation import evaluate, record_video
 from flash_rl.types import Tensor
 
 
+def _rng_state() -> dict:
+    state = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _save_resume(resume_dir: str, agent, train_env, interaction_step: int) -> None:
+    """Atomic resume snapshot: agent (networks, optimizers, schedulers, reward normaliser, update step), replay buffer,
+    interaction step, RNG states and the env's cross-episode state (body fatigue). Written to <dir>.tmp, then swapped."""
+    import shutil
+
+    tmp, old = resume_dir + ".tmp", resume_dir + ".old"
+    shutil.rmtree(tmp, ignore_errors=True)
+    agent.save(tmp)
+    agent.save_replay_buffer(tmp)
+    env_state = train_env.get_state() if hasattr(train_env, "get_state") else None
+    torch.save({"interaction_step": interaction_step, "rng": _rng_state(), "env_state": env_state}, os.path.join(tmp, "meta.pt"))
+    if os.path.isdir(resume_dir):
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(resume_dir, old)
+    os.replace(tmp, resume_dir)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _load_resume(resume_dir: str, agent, train_env) -> int:
+    meta = torch.load(os.path.join(resume_dir, "meta.pt"), weights_only=False)
+    agent.load(resume_dir)
+    agent.load_replay_buffer(resume_dir)
+    # Network.load restores optimizer states but not the LR schedulers; a resumed run continues its schedule.
+    for net, name in ((agent._actor, "actor"), (agent._critic, "critic"), (agent._temperature, "temperature")):
+        ckpt = torch.load(os.path.join(resume_dir, f"{name}.pt"), map_location="cpu", weights_only=False)
+        if net.scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            net.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    rng = meta["rng"]
+    random.setstate(rng["python"]); np.random.set_state(rng["numpy"]); torch.set_rng_state(rng["torch"])
+    if "cuda" in rng and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["cuda"])
+    if meta.get("env_state") is not None and hasattr(train_env, "set_state"):
+        train_env.set_state(meta["env_state"])
+    return int(meta["interaction_step"])
+
+
 def run(args: argparse.Namespace) -> None:
     ###############################
     # configs
@@ -101,22 +144,31 @@ def run(args: argparse.Namespace) -> None:
         load_path = os.path.join(script_dir, cfg.buffer_load_path)
         agent.load_replay_buffer(load_path)
 
-    # initial evaluation
-    eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
-    video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
-    logger.update_metric(**eval_info)
-    logger.update_metric(**video_info)
-    logger.log_metric(step=0)
-    logger.reset()
+    # resume (physical-exploration patch 3): continue from the last snapshot in cfg.resume_dir, if any
+    start_step = 1
+    resume_dir = cfg.get("resume_dir")
+    resumed = resume_dir is not None and os.path.isfile(os.path.join(resume_dir, "meta.pt"))
+    if resumed:
+        start_step = _load_resume(resume_dir, agent, train_env) + 1
+        print(f"Resumed from interaction step {start_step - 1}", flush=True)
+    else:
+        # initial evaluation
+        eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)
+        video_info = record_video(agent, record_env, cfg.num_record_episodes, cfg.env.env_type)
+        logger.update_metric(**eval_info)
+        logger.update_metric(**video_info)
+        logger.log_metric(step=0)
+        logger.reset()
 
     # start training
     observations, env_infos = train_env.reset()
     actions: Optional[Tensor] = None
-    transition: Optional[dict[str, Tensor]] = None
+    transition: Optional[dict[str, Tensor]] = {"next_observation": observations} if resumed else None
     update_counter = 0
     update_info = {}
+    env_step = (start_step - 1) * cfg.num_train_envs  # a leg resumed at the last step only runs the final evaluation
 
-    for interaction_step in tqdm.tqdm(range(1, int(cfg.num_interaction_steps + 1)), smoothing=0.1, mininterval=0.5):
+    for interaction_step in tqdm.tqdm(range(start_step, int(cfg.num_interaction_steps + 1)), smoothing=0.1, mininterval=0.5):
         # using env steps simplifies the comparison with the performance reported in the paper.
         env_step = interaction_step * cfg.num_train_envs
 
@@ -145,6 +197,8 @@ def run(args: argparse.Namespace) -> None:
             "truncated": truncateds,
             "next_observation": next_buffer_observations,
         }
+        if "heads" in env_infos:   # pxp.critic head signals (env type pxp)
+            transition["heads"] = env_infos["heads"]
         agent.process_transition(transition)
         transition["next_observation"] = next_observations
         observations = next_observations
@@ -190,6 +244,10 @@ def run(args: argparse.Namespace) -> None:
             if cfg.save_buffer_per_interaction_step and interaction_step % cfg.save_buffer_per_interaction_step == 0:
                 save_path = os.path.join(save_path_base, f"step{interaction_step}")
                 agent.save_replay_buffer(save_path)
+
+        # resume snapshot (patch 3), also before training starts so a preempted warm-up is not repeated
+        if resume_dir is not None and cfg.get("resume_every") and interaction_step % cfg.resume_every == 0:
+            _save_resume(resume_dir, agent, train_env, interaction_step)
 
     # final evaluation
     eval_info = evaluate(agent, eval_env, cfg.num_eval_episodes, cfg.env.env_type)

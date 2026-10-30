@@ -77,6 +77,10 @@ class FlashSACConfig:
     load_optimizer: bool
     load_reward_normalizer: bool
 
+    # physical-exploration patch 2: path of a pxp run's pxp_config.json whose `critic` block (pxp.critic) composes the
+    # critic over the env's head signals; null = this repository's own double critic, unchanged.
+    pxp_critic_config: Optional[str] = None
+
 
 def _init_flashsac_networks(
     actor_observation_dim: int,
@@ -84,6 +88,7 @@ def _init_flashsac_networks(
     action_dim: int,
     cfg: FlashSACConfig,
     device: torch.device,
+    num_qs: int = 2,
 ) -> tuple[Network, Network, Network, Network]:
     # Create learning rate schedule
     warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
@@ -128,6 +133,7 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=num_qs,
     ).to(device)
 
     critic_optimizer = optim.Adam(
@@ -156,6 +162,7 @@ def _init_flashsac_networks(
         num_bins=cfg.critic_num_bins,
         min_v=cfg.critic_min_v,
         max_v=cfg.critic_max_v,
+        num_qs=num_qs,
     ).to(device)
     target_critic_net.load_state_dict(critic_net.state_dict())
     target_critic = Network(
@@ -267,6 +274,7 @@ def _update_networks(
     do_actor_update: bool,
     device: torch.device,
     grad_scaler: Optional[GradScaler],
+    pxp: Any = None,
 ) -> dict[str, torch.Tensor]:
     if do_actor_update:
         # Update actor
@@ -279,6 +287,7 @@ def _update_networks(
             device=device,
             use_amp=cfg.use_amp,
             grad_scaler=grad_scaler,
+            pxp=pxp,
         )
 
         # Update temperature
@@ -306,6 +315,7 @@ def _update_networks(
         device=device,
         use_amp=cfg.use_amp,
         grad_scaler=grad_scaler,
+        pxp=pxp,
     )
 
     target_critic_info = update_target_network(
@@ -372,6 +382,19 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
         )
         self._device = torch.device(device_type)
 
+        # pxp.critic composition (patch 2): 2 twins per head as one fused ensemble ("separate" layout)
+        self._pxp = None
+        if cfg.pxp_critic_config:
+            import json
+
+            from pxp.critic import from_config
+
+            with open(cfg.pxp_critic_config) as f:
+                critic_cfg = json.load(f)["critic"]
+            self._pxp = from_config(critic_cfg, [tuple(h) for h in env_info["head_spec"]])
+            assert self._pxp.layout == "separate", "FlashSAC composes heads as separate twin critics (layout: separate)"
+            assert cfg.n_step == 1, "head signals are one-step"
+
         # Initialize networks
         (
             self._actor,
@@ -384,6 +407,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             action_dim=self._action_dim,
             cfg=self._cfg,
             device=self._device,
+            num_qs=2 if self._pxp is None else 2 * self._pxp.G,
         )
         self._update_step = 0
 
@@ -485,10 +509,18 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             batch["actor_observation"] = batch["observation"]
             batch["actor_next_observation"] = batch["next_observation"]
 
+        if self._pxp is not None:   # per-head rewards / dones in raw units, normalised below with the same scale
+            from pxp.critic import torch_face as C
+
+            batch["head_reward"], batch["head_done"] = C.head_rewards_and_dones(
+                self._pxp, batch["heads"][:, list(self._pxp.columns)], batch["reward"], batch["terminated"])
+
         if self._cfg.normalize_reward:
             assert self.reward_normalizer is not None
             # batch["unnormalized_reward"] = batch["reward"].clone()
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
+            if self._pxp is not None:
+                batch["head_reward"] = self.reward_normalizer.normalize_rewards(batch["head_reward"])
 
         # Update step
         _update_info = _update_networks(
@@ -501,6 +533,7 @@ class FlashSACAgent(BaseAgent[FlashSACConfig]):
             do_actor_update=(self._update_step % self._cfg.actor_update_period == 0),
             device=self._device,
             grad_scaler=self._grad_scaler,
+            pxp=self._pxp,
         )
         self._update_step += 1
 

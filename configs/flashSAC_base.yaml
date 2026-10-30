@@ -11,6 +11,8 @@ seed: 0
 logger_type: 'tensorboard'  # ['wandb','tensorboard']
 save_path: 'models/${group_name}/${exp_name}/${env.env_name}/seed${seed}-TIMESTAMP'   # absolute paths are used as given
 log_dir: null            # tensorboard directory; null = runs/<group>/<exp>/<env>_seed<seed>_<timestamp>
+resume_dir: null         # physical-exploration patch 3: resume snapshot directory (continue from it if present)
+resume_every: 0          # interaction steps between resume snapshots; 0 = never write one
 agent_load_path: null
 buffer_load_path: null
 

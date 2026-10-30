@@ -90,6 +90,7 @@ class TorchUniformBuffer(BaseBuffer):
         self._terminateds = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
         self._truncateds = torch.empty((m,), dtype=torch.float32, device=self._device, pin_memory=pin)
 
+        self._heads: Optional[torch.Tensor] = None   # (m, G) pxp.critic head signals, allocated on first use
         self._n_step_transitions: deque[dict[str, Any]] = deque(maxlen=self._n_step)
         self._num_in_buffer = 0
         self._current_idx = 0
@@ -159,6 +160,12 @@ class TorchUniformBuffer(BaseBuffer):
             self._rewards[idxs] = n_step_prev_transition["reward"].to(self._rewards.dtype)
             self._terminateds[idxs] = n_step_prev_transition["terminated"].to(self._terminateds.dtype)
             self._truncateds[idxs] = n_step_prev_transition["truncated"].to(self._truncateds.dtype)
+            if "heads" in n_step_prev_transition:   # pxp.critic: head signals of the stored step (n_step must be 1)
+                assert self._n_step == 1, "head signals are stored for one-step transitions only"
+                h = n_step_prev_transition["heads"].to(torch.float32)
+                if self._heads is None:
+                    self._heads = torch.zeros((self._max_length, h.shape[-1]), dtype=torch.float32, device=self._device)
+                self._heads[idxs] = h
 
             self._num_in_buffer = min(self._num_in_buffer + add_batch_size, self._max_length)
             self._current_idx = (self._current_idx + add_batch_size) % self._max_length
@@ -179,6 +186,8 @@ class TorchUniformBuffer(BaseBuffer):
         batch["terminated"] = self._terminateds[idxs]
         batch["truncated"] = self._truncateds[idxs]
         batch["next_observation"] = self._next_observations[idxs]
+        if self._heads is not None:
+            batch["heads"] = self._heads[idxs]
 
         return batch
 
@@ -197,6 +206,7 @@ class TorchUniformBuffer(BaseBuffer):
             "terminated": self._terminateds[:n],
             "truncated": self._truncateds[:n],
             "next_observation": self._next_observations[:n],
+            **({"heads": self._heads[:n]} if self._heads is not None else {}),
             "num_in_buffer": self._num_in_buffer,
             "current_idx": self._current_idx,
         }
@@ -217,6 +227,9 @@ class TorchUniformBuffer(BaseBuffer):
         self._rewards[:n] = dataset["reward"]
         self._terminateds[:n] = dataset["terminated"]
         self._truncateds[:n] = dataset["truncated"]
+        if "heads" in dataset:
+            self._heads = torch.zeros((self._max_length, dataset["heads"].shape[-1]), dtype=torch.float32, device=self._device)
+            self._heads[:n] = dataset["heads"]
 
         self._num_in_buffer = n
         self._current_idx = dataset["current_idx"]

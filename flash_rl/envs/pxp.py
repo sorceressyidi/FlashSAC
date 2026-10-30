@@ -41,6 +41,8 @@ class PxpVectorEnv(VectorEnv):
         self.env_info = {"actor_observation_size": (actor_dim,)}
         self.max_episode_steps = self._env.spec.max_steps
         self.head_spec = getattr(self._env, "head_spec", None)
+        if self.head_spec:
+            self.env_info["head_spec"] = [list(h) for h in self.head_spec]
 
     def reset(self, *, seed=None, options=None):
         obs = self._env.reset()["state"]
@@ -61,6 +63,13 @@ class PxpVectorEnv(VectorEnv):
             fresh = np.asarray(self._env.reset(np.flatnonzero(done))["state"], dtype=np.float32)
             obs[done] = fresh[done]
         return obs, np.asarray(reward, dtype=np.float32), terminated, truncated, out
+
+    def get_state(self):
+        """Cross-episode env state (body fatigue, sessions, reset streams) for exact resume."""
+        return self._env.get_state()
+
+    def set_state(self, state):
+        self._env.set_state(state)
 
     def render(self):
         raise NotImplementedError("pxp envs do not render; run with num_record_episodes=0")

@@ -87,8 +87,12 @@ def update_actor(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    pxp: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Update actor network.
+
+    pxp: a pxp.critic CriticSpec (physical-exploration patch 2) or None. With a spec the critic holds 2 twins per head,
+    each head's value is the min over its twins and the actor maximises sum_h w_h Q_h with the batch's head weights.
 
     Args:
         actor: Actor network.
@@ -119,7 +123,12 @@ def update_actor(
             actions=actions,
             training=False,
         )
-        q = torch.minimum(qs[0], qs[1])
+        if pxp is None:
+            q = torch.minimum(qs[0], qs[1])
+        else:
+            from pxp.critic import torch_face as C
+            q_h = qs.view(pxp.G, 2, -1).min(dim=1).values                       # (G, B)
+            q = C.aggregate(q_h, C.weights(pxp, batch["heads"][:, list(pxp.columns)]))
         critic.network.requires_grad_(True)
 
         temp_value = temperature().detach()
@@ -178,8 +187,13 @@ def update_critic(
     device: torch.device,
     use_amp: bool,
     grad_scaler: Optional[GradScaler],
+    pxp: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Update critic network.
+
+    pxp: a pxp.critic CriticSpec or None (see update_actor). With a spec, one categorical target per head from that
+    head's (normalised) reward and done in batch["head_reward"] / batch["head_done"], each against the min-twin of that
+    head; the entropy bonus enters every head's target, as vadar-public's sac_vadar (entropy_backup).
 
     Args:
         actor: Actor network.
@@ -223,19 +237,32 @@ def update_critic(
             )
             next_qs = qs_all.chunk(2, dim=1)[1]
             next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
-            next_q_log_probs = _select_min_q_log_probs(next_qs, next_q_log_probs)
+            if pxp is None:
+                next_q_log_probs = _select_min_q_log_probs(next_qs, next_q_log_probs)
 
-            # Compute target probs
-            target_probs = _compute_categorical_td_target(
-                target_log_probs=next_q_log_probs,
-                reward=batch["reward"],  # type: ignore
-                done=batch["terminated"],  # type: ignore
-                actor_entropy=next_actor_entropy,
-                gamma=gamma**n_step,
-                num_bins=num_bins,
-                min_v=min_v,
-                max_v=max_v,
-            )
+                # Compute target probs
+                target_probs = _compute_categorical_td_target(
+                    target_log_probs=next_q_log_probs,
+                    reward=batch["reward"],  # type: ignore
+                    done=batch["terminated"],  # type: ignore
+                    actor_entropy=next_actor_entropy,
+                    gamma=gamma**n_step,
+                    num_bins=num_bins,
+                    min_v=min_v,
+                    max_v=max_v,
+                )
+            else:
+                G = pxp.G
+                nq, nlp = next_qs.view(G, 2, -1), next_q_log_probs.view(G, 2, -1, num_bins)
+                target_probs = torch.stack([
+                    _compute_categorical_td_target(
+                        target_log_probs=_select_min_q_log_probs(nq[g], nlp[g]),
+                        reward=batch["head_reward"][g], done=batch["head_done"][g],
+                        actor_entropy=next_actor_entropy, gamma=gamma**n_step,
+                        num_bins=num_bins, min_v=min_v, max_v=max_v,
+                    )
+                    for g in range(G)
+                ])                                                                   # (G, B, bins)
             max_entropy_bonus = next_actor_entropy.max()
 
         # Compute predicted q-value
@@ -246,7 +273,11 @@ def update_critic(
         )
         pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
 
-        ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)  # (2, B)
+        if pxp is None:
+            ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)  # (2, B)
+        else:
+            pred = pred_log_probs.view(pxp.G, 2, -1, num_bins)
+            ce_loss = -(target_probs.unsqueeze(1) * pred).sum(dim=-1)            # (G, 2, B)
         critic_loss = ce_loss.mean()
 
     # Gradient step

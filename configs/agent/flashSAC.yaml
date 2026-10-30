@@ -54,3 +54,7 @@ use_amp: true
 
 load_optimizer: true
 load_reward_normalizer: true
+
+# physical-exploration patch 2: path to a pxp run's pxp_config.json; its critic block composes the critic over the env's
+# head signals (pxp.critic). null = this repository's own double critic, unchanged.
+pxp_critic_config: null
